@@ -1,0 +1,20 @@
+---
+
+# Defaults / examples
+# Configure here or override with -e
+
+#  Create vlan group with this name:
+vlan_group_name: "VOICE"
+
+#   force_vlan_id:
+#   Uncomment this to force creation of vlan_group_name with a single VLAN
+#   ID force_vlan_id instead of scanning for configured vlans matching
+#   search_vlan_pattern.
+# force_vlan_id: 555
+
+#  search_vlan_pattern:
+
+#  Search for ports configured in VLAN's matching this regex pattern.
+#  Matching VLAN ID's will be adeded to vlan_group_name
+#  NB: (?i)voip won't match bla-VOIP-123, instead use (?i)^.*voip
+search_vlan_pattern: '(?i)^([a-z]{1,2})?\d+\w*-voip-\d+'

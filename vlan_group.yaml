@@ -1,0 +1,153 @@
+
+---
+
+- hosts: "{{ which_hosts | default('campus_access') }}"
+  connection: "network_cli"
+  gather_facts: no
+
+  vars_files:
+    - vars/vlan_group.yaml
+  vars:
+    #   only create vlan groups when ports are configured in said vlan:
+    only_vlans_with_configured_ports: true
+    #  Cisco IOS command to delete an existing vlan group
+    #  unlike trunk allowed vlan, IOS didn't implement add/remove for vlan group
+    #  and the number of vlan's varies between IOS versions.
+    cmds_remove_vlan_group:
+      - "no vlan group {{ vlan_group_name }} vlan-list 1-1005"
+      - "no vlan group {{ vlan_group_name }} vlan-list 1-4094"
+    #
+    # File locations:
+    vlan_parse_path: parsers/ios_show_vlan.yaml
+
+  roles:
+    - ansible-network.network-engine
+
+
+  tasks:
+
+    #
+    # Step 1: gather info from Source of Truth
+    #         in this case: the individual switch configuration :(
+    #
+
+    # NB: 'show vlan' excludes trunks (and that's how we like it here).
+    #     show vlan id <id> does include trunk ports in case you wondered.
+
+    - block:
+        - name: "Get vlan list from switch, parse into structured data"
+          ios_command:
+            commands:
+              - "show vlan"
+          register: vlan_output
+        - set_fact:
+            all_vlans: "{{
+              vlan_output.stdout[0]
+              | parse_cli(vlan_parse_path) }}"
+      when: force_vlan_id is not defined
+
+    - name: "Force VLAN ID for vlan group ?"
+      set_fact:
+        search_vlan_pattern: "VLAN_{{ force_vlan_id }}"
+        all_vlans: {
+          'vlans': [
+            {
+              'id': "{{ force_vlan_id }}",
+              'ports': ['Gi555'],
+              'name': "VLAN_{{ force_vlan_id }}",
+              'status': 'active'
+            },
+          ]
+        }
+      when: force_vlan_id is defined
+
+
+    #
+    # Step 2: Apply changes
+    #
+
+    # selectattr(only_vlans_with_configured_ports | bool | ternary('ports', 'id'))
+    # cleans up the loop output
+    - block:
+        - name: "Build list of vlan group commands"
+          set_fact:
+            # vlan_list: "{{ vlan_list|default('') + ' ' +  item.id|string }}"
+            vlan_list: "{{ vlan_list|default([]) + [ item.id|int ] }}"
+            vlan_group_commands: "{{
+              vlan_group_commands|default([])
+              + [ 'vlan group ' + vlan_group_name
+                  + ' vlan-list ' + item.id|string ]
+              }}"
+          loop: "{{
+                 all_vlans['vlans']
+                 | selectattr('name', 'match', search_vlan_pattern)
+                 | selectattr(only_vlans_with_configured_ports | bool
+                              | ternary('ports', 'id'))
+                 | list
+                }}"
+          loop_control:
+            index_var: idx
+        - name: "Check if VLANs found"
+          fail: msg="No ports in vlans, or no vlan matched {{ search_vlan_pattern }}"
+          failed_when: vlan_list is not defined
+
+    - name: "Show config commands to be executed"
+      debug:
+        msg: "{{ vlan_group_commands }}"
+      when: vlan_group_commands is defined
+
+    # combining remove+add in one ios_config session sometimes fails ?!
+    # stay on the safe side
+    - name: "Remove current vlan group {{ vlan_group_name }}"
+      ios_config:
+        lines: "{{ cmds_remove_vlan_group }}"
+      when: vlan_group_commands is defined
+            and not ansible_check_mode
+
+    - name: "Configure vlan group {{ vlan_group_name }}"
+      ios_config:
+        lines: "{{ vlan_group_commands }}"
+        save_when: changed
+      register: commands
+      when: vlan_group_commands is defined
+            and not ansible_check_mode
+
+
+    #
+    # Step 3: Validation/compliance checks
+    #         (i.e. changes applied succesfully and active ?)
+    #
+
+    # use failed_when instead of when to get an 'ok' instead of 'skipping'
+    - name: "Retrieve active vlan group"
+      ios_command:
+        commands:
+          # - "show vlan group | include {{ vlan_group_name }} :"
+          - "show vlan group group-name {{ vlan_group_name }}"
+        wait_for:
+          - result[0] contains "{{ vlan_group_name }}"
+      failed_when: false
+      register: vlan_group_output
+      when: vlan_group_commands is defined
+
+    - name: "Validation/compliance check #1"
+      fail:
+        msg: "Missing vlan group {{ vlan_group_name }} on {{ inventory_hostname }}"
+      failed_when: vlan_group_commands is defined
+        and (not vlan_group_output
+        or 'failed_conditions' in vlan_group_output)
+
+    - block:
+        - name: "Convert vlan lists into range strings"
+          set_fact:
+            desired_vlan_group: "{{
+              vlan_list | vlan_compress | replace(' ', '') }}"
+            active_vlan_group: "{{
+              vlan_group_output.stdout[0].split(':')[1] | replace(' ', '') }}"
+        - name: "Validation/compliance check #2"
+          fail:
+            msg:
+              - "vlan group {{ vlan_group_name }} not in desired state (active != desired):"
+              - "{{ active_vlan_group }} != {{ desired_vlan_group }}"
+          failed_when: active_vlan_group != desired_vlan_group
+      when: vlan_group_commands is defined
